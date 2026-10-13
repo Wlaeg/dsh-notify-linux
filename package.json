@@ -1,0 +1,32 @@
+{
+  "name": "dsh-notify-linux",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 完成任务、需要你选择或需要批准时，发送桌面通知并播放提示音。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}

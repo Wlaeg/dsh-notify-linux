@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Task Notifications",
+    "description": "Desktop notifications and a chime when DSH finishes a turn, needs your choice, or needs your approval. Switches, event types and the cooldown live in Settings."
+  }
+}
