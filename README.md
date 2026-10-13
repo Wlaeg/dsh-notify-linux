@@ -125,6 +125,14 @@ bare package name — subpath rows do not carry a browser half.
 After installing, the plugin is active. Reload the DSH Web UI page so the browser half
 registers its Settings section. There is no separate CLI install step.
 
+> **Replacing an already-installed copy** (for example after editing the source) needs a
+> restart of the DSH host process. The plugin manager rewrites the dependency and the
+> patch immediately, but the running process keeps the JS module generation it loaded at
+> startup, so the old routes and handlers stay live until DSH restarts. A page reload is
+> not enough. The host half's HTTP routes make this easy to see: while a stale copy is
+> still running, `GET /api/dsh-notify-linux/config` answers `401` because the old
+> `/api/dsh-notify` prefix route is still claiming the path.
+
 ---
 
 ## Settings
