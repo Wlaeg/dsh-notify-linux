@@ -24,3 +24,6 @@ Thumbs.db
 # Local scratch
 *.bak
 /tmp-test/
+
+# 重启验收的临时输出
+restart-verify-result.txt
