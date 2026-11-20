@@ -9,8 +9,9 @@
  *     3. 兜底：当 Host 侧的系统通知或声音实际没送出去（非 Linux、没装
  *        libnotify、声音文件缺失），用 Web Notification 与 Web Audio 补齐。
  *
- * 兜底与否由 Host 在事件里回的 `desktop` / `sound` 布尔决定——也就是「真的
- * 发出去了没有」，而不是两边都发一遍造成重复打扰。
+ * 兜底与否由 Host 在事件里回的 `desktop` / `sound` / `channel` 决定——也就是「真的
+ * 发出去了没有」，而不是两边都发一遍造成重复打扰。`channel: 'browser'` 表示用户打开了
+ * 「优先用浏览器通知」：这时由本半身弹通知，点击它浏览器会把本标签页切到前台。
  *
  * 手写 ModuleLoader 包：无构建步骤，除 shell 已提供的 `react` 外无依赖。
  * 颜色全部走主题变量，跟随明暗切换。
@@ -66,8 +67,10 @@ window.__ModuleLoader__.load({
         cooldown: '冷却时间',
         cooldownHint: '同一类提醒在这个间隔内只发一次，单位秒。',
         cooldownUnit: '秒',
-        browser: '浏览器兜底',
-        browserHint: '当上面的系统通知或声音没能送出时（例如非 Linux 环境），改用浏览器自己的通知与合成提示音。',
+        browser: '浏览器通知',
+        browserHint: '页面开着时可以用浏览器自己的通知：点击通知，浏览器会切回弹通知的那个标签页。系统通道不可用时也会自动用它兜底。',
+        browserFirst: '优先用浏览器通知',
+        browserFirstHint: '开着这个页面时改用浏览器通知，不再弹系统通知。点通知浏览器会切回本标签页；页面关掉后自动退回系统通知。',
         browserToast: '页内浮层',
         browserNotify: '浏览器通知',
         browserNotifyHint: '需要授予浏览器通知权限。',
@@ -90,6 +93,8 @@ window.__ModuleLoader__.load({
         permDenied: '已拒绝',
         permDefault: '未授予（打开开关时会请求）',
         permUnsupported: '当前环境不支持',
+        permissionRow: '浏览器通知权限',
+        permAllow: '请求授权',
         toastTurnEnd: 'DSH 已完成任务',
         toastQuestion: 'DSH 正在等待你的选择',
         toastApproval: 'DSH 需要你的批准',
@@ -135,8 +140,10 @@ window.__ModuleLoader__.load({
         cooldown: 'Cooldown',
         cooldownHint: 'At most one notification of the same kind within this interval, in seconds.',
         cooldownUnit: 's',
-        browser: 'Browser fallback',
-        browserHint: 'When the system notification or sound above could not be delivered (for example off Linux), fall back to the browser notification and a synthesised chime.',
+        browser: 'Browser notifications',
+        browserHint: 'When this page is open you can use the browser notification: clicking one switches the browser back to the tab that raised it. It also takes over when the system channel is unavailable.',
+        browserFirst: 'Prefer browser notifications',
+        browserFirstHint: 'While this page stays open, notifications come from the browser instead of the system. Clicking one returns the browser to this tab; with the page closed it falls back to the system notification.',
         browserToast: 'In-page toast',
         browserNotify: 'Browser notification',
         browserNotifyHint: 'Requires the browser notification permission.',
@@ -159,6 +166,8 @@ window.__ModuleLoader__.load({
         permDenied: 'denied',
         permDefault: 'not granted (requested when you flip the switch)',
         permUnsupported: 'not supported here',
+        permissionRow: 'Notification permission',
+        permAllow: 'Request permission',
         toastTurnEnd: 'DSH finished the task',
         toastQuestion: 'DSH is waiting for your choice',
         toastApproval: 'DSH needs your approval',
@@ -226,6 +235,31 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 本标签页的稳定标识。SSE 连接与 /presence 都带上它，Host 才能把「哪个页面在前台」
+     * 对应到具体那条连接；开了多个 DSH 标签页时也只给最近在用的那个发通知。
+     */
+    const clientId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `dsn-${Math.random().toString(36).slice(2)}-${Date.now()}`
+
+    /**
+     * 上报前台状态，以及「这个标签页到底能不能弹出浏览器通知」。
+     * 后者是硬约束：没有授权时 new Notification() 会被浏览器静默丢掉，
+     * Host 据此决定是走浏览器通道还是回退系统通知，避免两边都不响。
+     */
+    function reportPresence() {
+      api('/presence', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          focused: document.hasFocus(),
+          clientId,
+          notify: permissionState() === 'granted',
+        }),
+      }).catch(() => { /* 后端不可达，忽略 */ })
+    }
+
     // ── 浏览器兜底：通知与合成提示音 ──────────────────────────────────────────
 
     /** 浏览器通知权限的当前状态，用于设置页展示。 */
@@ -285,6 +319,7 @@ window.__ModuleLoader__.load({
           tag: `dsh-notify-linux-${kind}`, // 同类顶替，不刷满通知中心
           silent: true,
         })
+        // 浏览器会把发通知的那个标签页切到前台；页面内再补一次 focus 兜底。
         note.onclick = () => { try { window.focus(); note.close() } catch { /* 忽略 */ } }
         return true
       } catch { return false }
@@ -387,9 +422,10 @@ window.__ModuleLoader__.load({
 
       useEffect(() => { load() }, [load])
 
-      // 设置页开着时权限可能被用户在浏览器侧改掉，回来重读一次。
+      // 设置页开着时权限可能被用户在浏览器侧改掉，回来重读一次；
+      // 顺便把「能不能弹浏览器通知」的最新结论同步给 Host。
       useEffect(() => {
-        const onFocus = () => setPermission(permissionState())
+        const onFocus = () => { setPermission(permissionState()); reportPresence() }
         window.addEventListener('focus', onFocus)
         return () => window.removeEventListener('focus', onFocus)
       }, [])
@@ -502,6 +538,29 @@ window.__ModuleLoader__.load({
       ]
 
       const browserRows = [
+        // 权限单独一行 + 显式按钮：开关状态由配置决定，权限却只能由用户手势触发，
+        // 两者混在一起会让人以为「开了开关就会有通知」。
+        h(Row, { key: 'perm', label: t('permissionRow'), hint: permissionText },
+          permission === 'granted'
+            ? h('span', { className: 'dsn_new' }, t('permGranted'))
+            : h('button', {
+                className: 'dsn_btn',
+                disabled: permission === 'unsupported',
+                onClick: () => {
+                  requestPermission()
+                  setTimeout(() => { setPermission(permissionState()); reportPresence() }, 600)
+                },
+              }, t('permAllow'))),
+        h(Row, { key: 'first', label: t('browserFirst'), hint: t('browserFirstHint') },
+          h(Toggle, {
+            checked: state.browserFirst === true,
+            disabled: locked,
+            onChange: value => {
+              if (value) requestPermission()
+              patch({ browserFirst: value })
+              setTimeout(() => setPermission(permissionState()), 300)
+            },
+          })),
         h(Row, { key: 'toast', label: t('browserToast'), hint: '' },
           h(Toggle, { checked: state.browserToast, disabled: locked, onChange: value => patch({ browserToast: value }) })),
         h(Row, { key: 'web', label: t('browserNotify'), hint: `${t('browserNotifyHint')} ${t('permissionHint')}${permissionText}` },
@@ -582,7 +641,11 @@ window.__ModuleLoader__.load({
         let retryTimer
         let failures = 0
         let closed = false
-        let config = { enabled: true, browserToast: true, browserNotify: true, browserSound: false }
+        let config = { enabled: true, browserToast: true, browserNotify: true, browserSound: false, browserFirst: false }
+
+        // 本标签页的标识：随 SSE 连接与 /presence 一起上报，Host 据此把通知定向发给
+        // 用户最近在用的那个页面，开了多个 DSH 标签页时也只弹一条通知。
+        // clientId 与 reportPresence 定义在模块作用域（设置页也要用同一份）。
 
         const refreshConfig = () => {
           api('/config')
@@ -603,11 +666,18 @@ window.__ModuleLoader__.load({
           const body = typeof payload?.body === 'string' ? payload.body : ''
 
           if (config.enabled !== true) return
-          if (config.browserToast !== false) showToast(title, body, kind, () => { try { window.focus() } catch { /* 忽略 */ } })
 
-          // 只在 Host 侧确实没送出去时才兜底，两边都发会重复打扰。
+          // 点通知/浮层时把窗口提到前台（会话切换是后续提交的事）。
+          const focus = () => { try { window.focus() } catch { /* 忽略 */ } }
+
+          if (config.browserToast !== false) showToast(title, body, kind, focus)
+
+          // channel==='browser'：Host 判定应由浏览器通知接手（页面开着，且用户选了
+          // 「优先用浏览器通知」）。否则沿用兜底语义：只在 Host 侧确实没送出去时才发，
+          // 两边都发会重复打扰。
           const systemNotifyBroken = capabilities?.notifySend !== true
-          if (payload?.desktop !== true && systemNotifyBroken && config.browserNotify !== false) {
+          const byBrowser = payload?.channel === 'browser'
+          if (config.browserNotify !== false && (byBrowser || (payload?.desktop !== true && systemNotifyBroken))) {
             webNotify(title, body, kind)
           }
           const systemSoundBroken = capabilities?.paplay !== true && capabilities?.canberra !== true
@@ -628,7 +698,7 @@ window.__ModuleLoader__.load({
         const connect = () => {
           if (closed) return
           if (typeof EventSource !== 'function') return
-          try { source = new EventSource(`${API}/events`) } catch { return }
+          try { source = new EventSource(`${API}/events?client=${encodeURIComponent(clientId)}`) } catch { return }
           source.addEventListener('notify', onNotify)
           source.addEventListener('hello', onHello)
           source.addEventListener('config', onConfig)
@@ -644,13 +714,6 @@ window.__ModuleLoader__.load({
         }
         connect()
 
-        const reportPresence = () => {
-          api('/presence', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ focused: document.hasFocus() }),
-          }).catch(() => { /* 后端不可达，忽略 */ })
-        }
         reportPresence()
         window.addEventListener('focus', reportPresence)
         window.addEventListener('blur', reportPresence)

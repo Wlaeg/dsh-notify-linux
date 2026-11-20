@@ -13,11 +13,16 @@
  * 通知与声音全部 fire-and-forget：事件分发路径上绝不 await 外部进程，
  * 也绝不因为通知失败而影响 agent 的正常流程。
  *
- * 【为什么在 Host 侧发通知，而不是浏览器侧】
+ * 【为什么默认在 Host 侧发通知，而不是浏览器侧】
  * 浏览器通知只在页面开着时有效，用户切走窗口、最小化或关掉页面就收不到；
  * 而 DSH 主进程活着的时间更长，`notify-send` 走 GNOME 通知中心，
  * 即使页面没聚焦、甚至浏览器不在前台，通知和声音一样会到。
- * 浏览器半身负责的是「页面内看得见」和「浏览器通知兜底」。
+ * 浏览器半身负责「页面内看得见」和「浏览器通知兜底」。
+ *
+ * 唯一的例外是用户打开 `browserFirst`：页面开着（有 SSE 连接）时改由浏览器通知
+ * 投递——系统通知没有动作（action），点击只会消失；浏览器通知被点击时，浏览器会
+ * 把发通知的那个标签页切到前台，这正是「点通知回到 DSH」想要的效果。页面关掉后
+ * 没有连接可投，自动退回系统通知。
  *
  * 【为什么 waterfall 事件里必须 return next()】
  * `user-questions/request` 与 `approval/request` 都是 waterfall（串行责任链）
@@ -68,6 +73,9 @@ const DEFAULTS = {
   browserToast: true,
   browserNotify: true,
   browserSound: false,
+  // 优先用浏览器通知：页面开着时由浏览器投递（点击通知，浏览器会把该标签页切到前台），
+  // 页面关着时没有任何 SSE 连接，自动退回系统通知。
+  browserFirst: false,
   soundTheme: 'complete',
   events: { turnEnd: true, question: true, approval: true, error: true },
   includeSubagents: false,
@@ -101,6 +109,7 @@ function sanitize(raw) {
     browserToast: bool(src.browserToast, DEFAULTS.browserToast),
     browserNotify: bool(src.browserNotify, DEFAULTS.browserNotify),
     browserSound: bool(src.browserSound, DEFAULTS.browserSound),
+    browserFirst: bool(src.browserFirst, DEFAULTS.browserFirst),
     soundTheme: Object.hasOwn(SOUND_THEMES, src.soundTheme) ? src.soundTheme : DEFAULTS.soundTheme,
     events,
     includeSubagents: bool(src.includeSubagents, DEFAULTS.includeSubagents),
@@ -212,8 +221,14 @@ export function apply(ctx) {
   let config = readConfig()
   /** 每类事件上次触发的时间戳，用于冷却。 */
   const lastFired = new Map()
-  /** 正在订阅 SSE 的响应对象。 */
-  const streams = new Set()
+  /**
+   * 正在订阅 SSE 的响应对象 → 该连接的元信息。
+   *
+   * `clientId` 由浏览器半身生成，经 `?client=` 与 `/presence` 上报关联到具体连接。
+   * 浏览器通知按「用户最近在用的那个标签页」定向投递：开三个 DSH 标签页时，
+   * 一次提醒也只弹一条，而不是三条。
+   */
+  const streams = new Map()
 
   const logger = ctx?.logger ?? console
 
@@ -228,9 +243,44 @@ export function apply(ctx) {
     } catch {
       return
     }
-    for (const res of streams) {
+    for (const res of streams.keys()) {
       try { res.write(frame) } catch { /* 断开的连接由 close 事件清理 */ }
     }
+  }
+
+  /** 只给一条 SSE 连接发一帧（浏览器通知定向投递用）。 */
+  function sendTo(res, event, data) {
+    let frame
+    try {
+      frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    } catch {
+      return
+    }
+    try { res.write(frame) } catch { /* 断开的连接由 close 事件清理 */ }
+  }
+
+  /**
+   * 挑出浏览器通知的投递目标：优先「最近一次上报为聚焦」的连接，其次「最近上报过
+   * presence」的连接，最后按建立顺序取第一个。指向的是具体标签页，因此点击通知后
+   * 浏览器会把那个标签页切到前台，正是用户想回到的那个页面。
+   *
+   * 只在「确实能弹浏览器通知」的连接里挑：浏览器半身会经 /presence 上报 notify，
+   * 没授权时为 false，此时返回 null，让调用方回退系统通知——否则两边都不响。
+   * notify 为 null 表示还没上报过（旧半身或刚连上），按可用处理。
+   */
+  function pickStream() {
+    let best = null
+    for (const [res, meta] of streams) {
+      if (meta.notify === false) continue
+      if (best === null) { best = [res, meta]; continue }
+      const [, cur] = best
+      if (meta.focused !== cur.focused) {
+        if (meta.focused) best = [res, meta]
+        continue
+      }
+      if (meta.at > cur.at) best = [res, meta]
+    }
+    return best === null ? null : best[0]
   }
 
   /** 会话的展示信息：工作区名 + 会话 id 短号，够用户在通知里认出是哪一摊活。 */
@@ -265,10 +315,17 @@ export function apply(ctx) {
 
       // 窗口在前台时不必再弹系统通知和声音——用户就在看。
       const suppressSystem = config.onlyWhenUnfocused && windowFocused
+
+      // 「优先浏览器通知」：页面开着才有 SSE 连接可投。目标连接由最近一次
+      // /presence 挑出，多标签页下也只弹一条，且点击后回到那个标签页。
+      const target = config.browserFirst === true && !suppressSystem ? pickStream() : null
+      const channel = target === null ? 'none' : 'browser'
+
       let desktop = false
       let sound = false
       if (!suppressSystem) {
-        if (config.systemNotify) desktop = sendDesktop(title, body, kind)
+        // 浏览器通知已经接手时不再发系统通知，否则同一次提醒会响两遍。
+        if (config.systemNotify && channel !== 'browser') desktop = sendDesktop(title, body, kind)
         if (config.systemSound) {
           const sound$ = kind === 'turnEnd' ? SOUND_THEMES[config.soundTheme] : SOUND_BY_KIND[kind]
           sound = playSound(sound$ ?? null)
@@ -276,7 +333,9 @@ export function apply(ctx) {
       }
 
       // 把实际发生了什么告诉浏览器半身：它据此决定是否用浏览器通知/声音兜底。
-      broadcast('notify', { ...payload, desktop, sound })
+      const frame = { ...payload, desktop, sound, channel }
+      if (target !== null) sendTo(target, 'notify', frame)
+      else broadcast('notify', frame)
     } catch (error) {
       logger.warn?.(`[${NS}] 发送通知失败：${error?.message ?? error}`)
     }
@@ -404,6 +463,8 @@ export function apply(ctx) {
    * 的结果决定谁来发，而不是两边都发。
    */
   function openStream(req, res) {
+    // 连接标识：浏览器半身生成并经 ?client= 带来，/presence 上报时用它回指本连接。
+    const clientId = String(new URL(req.url ?? '/', 'http://localhost').searchParams.get('client') ?? '').slice(0, 64)
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-store',
@@ -411,7 +472,7 @@ export function apply(ctx) {
       'x-accel-buffering': 'no',
     })
     res.write(': connected\n\n')
-    streams.add(res)
+    streams.set(res, { clientId, focused: false, notify: null, at: Date.now() })
     // 心跳让中间的代理/浏览器不把空闲连接掐掉。
     const keepAlive = setInterval(() => {
       try { res.write(': ping\n\n') } catch { /* 下面统一清理 */ }
@@ -444,7 +505,14 @@ export function apply(ctx) {
         if (method === 'GET' && route === '/events') return openStream(req, res)
 
         if (method === 'GET' && route === '/config') {
-          return send(200, { config, capabilities: capabilities(), sounds: availableSounds(), focused: windowFocused })
+          // clients 只读：排查「通知到底发给了哪个标签页」时不用再猜。
+          const clients = [...streams.values()].map(meta => ({
+            clientId: meta.clientId,
+            focused: meta.focused === true,
+            notify: meta.notify,
+            at: meta.at,
+          }))
+          return send(200, { config, capabilities: capabilities(), sounds: availableSounds(), focused: windowFocused, clients })
         }
 
         if (method === 'POST' && route === '/config') {
@@ -469,10 +537,23 @@ export function apply(ctx) {
           return send(200, { ok: true, kind, config })
         }
 
-        // 窗口聚焦状态：用于「只在窗口不在前台时通知」这一档。
+        // 窗口聚焦状态：用于「只在窗口不在前台时通知」这一档，同时同步到具体连接，
+        // 供「优先浏览器通知」挑选定向投递的标签页。
         if (method === 'POST' && route === '/presence') {
           const body = await readJson(req)
-          windowFocused = body?.focused !== false
+          const focused = body?.focused !== false
+          windowFocused = focused
+          const clientId = typeof body?.clientId === 'string' ? body.clientId.slice(0, 64) : ''
+          // notify：这个标签页是否真的拿到了浏览器通知权限。未带该字段时保持原值。
+          const canNotify = typeof body?.notify === 'boolean' ? body.notify : null
+          for (const meta of streams.values()) {
+            // 旧版浏览器半身不带 clientId：退回「更新全部连接」的旧语义。
+            if (clientId === '' || meta.clientId === clientId) {
+              meta.focused = focused
+              if (canNotify !== null) meta.notify = canNotify
+              meta.at = Date.now()
+            }
+          }
           return send(200, { focused: windowFocused })
         }
 
