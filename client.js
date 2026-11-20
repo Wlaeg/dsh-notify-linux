@@ -310,7 +310,7 @@ window.__ModuleLoader__.load({
       setTimeout(() => { try { void ac.close() } catch { /* 已关闭 */ } }, 800)
     }
 
-    function webNotify(title, body, kind) {
+    function webNotify(title, body, kind, activate) {
       if (typeof Notification === 'undefined') return false
       if (Notification.permission !== 'granted') return false
       try {
@@ -319,8 +319,11 @@ window.__ModuleLoader__.load({
           tag: `dsh-notify-linux-${kind}`, // 同类顶替，不刷满通知中心
           silent: true,
         })
-        // 浏览器会把发通知的那个标签页切到前台；页面内再补一次 focus 兜底。
-        note.onclick = () => { try { window.focus(); note.close() } catch { /* 忽略 */ } }
+        note.onclick = () => {
+          // 浏览器只会把窗口提上来；切到通知所属会话得靠页面自己（activate）。
+          try { if (typeof activate === 'function') activate() } catch { /* 忽略 */ }
+          try { window.focus(); note.close() } catch { /* 忽略 */ }
+        }
         return true
       } catch { return false }
     }
@@ -667,10 +670,28 @@ window.__ModuleLoader__.load({
 
           if (config.enabled !== true) return
 
-          // 点通知/浮层时把窗口提到前台（会话切换是后续提交的事）。
-          const focus = () => { try { window.focus() } catch { /* 忽略 */ } }
+          // 点击通知/浮层要回到「发起这条通知的会话」。DSH Web 的所有会话共用
+          // 同一个地址，浏览器最多把标签页提到前台，剩下这一步必须页面自己做。
+          const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
+          const activate = () => {
+            if (sessionId !== '') {
+              // 切会话只能靠客户端服务：ctx.uiWorkspace 需要 inject 才可读，因此先试
+              // 直接取，未注入时再用 reflect.get 兜底（取不到就只提窗口，不报错）。
+              let workspace = null
+              try { workspace = ctx.uiWorkspace } catch { /* 未 inject，走兜底 */ }
+              if (!workspace) { try { workspace = ctx.reflect?.get?.('uiWorkspace') ?? null } catch { /* 忽略 */ } }
+              try { workspace?.openSession(sessionId) } catch (error) { console.warn('dsh-notify-linux: openSession failed', error) }
+            }
+            try { window.focus() } catch { /* 忽略 */ }
+            // 回执：Host 侧留有记录，用来确认点击事件确实回到了页面。
+            api('/click', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId, kind }),
+            }).catch(() => { /* 忽略 */ })
+          }
 
-          if (config.browserToast !== false) showToast(title, body, kind, focus)
+          if (config.browserToast !== false) showToast(title, body, kind, activate)
 
           // channel==='browser'：Host 判定应由浏览器通知接手（页面开着，且用户选了
           // 「优先用浏览器通知」）。否则沿用兜底语义：只在 Host 侧确实没送出去时才发，
@@ -678,7 +699,7 @@ window.__ModuleLoader__.load({
           const systemNotifyBroken = capabilities?.notifySend !== true
           const byBrowser = payload?.channel === 'browser'
           if (config.browserNotify !== false && (byBrowser || (payload?.desktop !== true && systemNotifyBroken))) {
-            webNotify(title, body, kind)
+            webNotify(title, body, kind, activate)
           }
           const systemSoundBroken = capabilities?.paplay !== true && capabilities?.canberra !== true
           if (payload?.sound !== true && systemSoundBroken && config.browserSound === true) beep(kind)

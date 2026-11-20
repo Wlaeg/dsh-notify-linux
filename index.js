@@ -235,6 +235,12 @@ export function apply(ctx) {
   /** 当前窗口是否聚焦。由浏览器半身经 /presence 上报，未知时按「聚焦」处理。 */
   let windowFocused = true
 
+  /**
+   * 最近一次浏览器通知点击的回执。Chromium 点通知时是否把 click 交回页面
+   * 在各平台上并不一致，留一条回执才能分辨「没跳转」是没收到点击还是没跳成。
+   */
+  let lastClick = null
+
   function broadcast(event, data) {
     if (streams.size === 0) return
     let frame
@@ -289,7 +295,9 @@ export function apply(ctx) {
     const cwd = typeof header?.cwd === 'string' && header.cwd !== '' ? header.cwd : ''
     const workspace = cwd === '' ? 'DSH' : path.basename(cwd)
     const id = String(agent?.session?.id ?? '')
-    return { workspace, shortId: id === '' ? '' : id.slice(0, 8) }
+    // id 全量随通知一起发给浏览器半身：DSH Web 所有会话共用一个 URL，点通知后
+    // 要靠它调 uiWorkspace.openSession() 才能真的切到发起通知的那个会话。
+    return { workspace, shortId: id === '' ? '' : id.slice(0, 8), id }
   }
 
   /** 子代理（subagent）的会话在 header 里带 origin 标记。 */
@@ -301,7 +309,7 @@ export function apply(ctx) {
    * 触发一次通知。所有分支都在 try 里：通知功能任何异常都不该冒泡进
    * agent 的事件分发路径。
    */
-  function fire(kind, title, body) {
+  function fire(kind, title, body, sessionId = '') {
     try {
       if (!config.enabled) return
       if (config.events[kind] === false) return
@@ -311,7 +319,7 @@ export function apply(ctx) {
       if (cooldown > 0 && now - (lastFired.get(kind) ?? 0) < cooldown) return
       lastFired.set(kind, now)
 
-      const payload = { kind, title, body, at: now }
+      const payload = { kind, title, body, at: now, sessionId }
 
       // 窗口在前台时不必再弹系统通知和声音——用户就在看。
       const suppressSystem = config.onlyWhenUnfocused && windowFocused
@@ -348,9 +356,9 @@ export function apply(ctx) {
   ctx.on('agent/turn-stopping', payload => {
     const agent = payload?.agent
     if (agent && isSubagent(agent) && !config.includeSubagents) return
-    const { workspace, shortId } = describe(agent)
+    const { workspace, shortId, id } = describe(agent)
     const suffix = shortId === '' ? '' : ` · ${shortId}`
-    fire('turnEnd', 'DSH 已完成任务', `${workspace}${suffix} 的回合已结束`)
+    fire('turnEnd', 'DSH 已完成任务', `${workspace}${suffix} 的回合已结束`, id)
   })
 
   // 「有选择」：模型请求用户作答（单选/多选/自由文本）。
@@ -363,8 +371,8 @@ export function apply(ctx) {
         const text = typeof first?.question === 'string' && first.question !== '' ? first.question : '需要你做出选择'
         const count = Array.isArray(request?.questions) ? request.questions.length : 0
         const more = count > 1 ? `（共 ${count} 个问题）` : ''
-        const { workspace } = describe(agent)
-        fire('question', 'DSH 正在等待你的选择', `${workspace}：${text}${more}`)
+        const { workspace, id } = describe(agent)
+        fire('question', 'DSH 正在等待你的选择', `${workspace}：${text}${more}`, id)
       }
     } catch (error) {
       logger.warn?.(`[${NS}] 处理 user-questions/request 失败：${error?.message ?? error}`)
@@ -380,8 +388,8 @@ export function apply(ctx) {
         const tool = typeof request?.toolName === 'string' ? request.toolName : '某个工具'
         const reason = request?.displayReason?.zh || request?.displayReason?.en || request?.reason
         const detail = typeof reason === 'string' && reason !== '' ? `：${reason}` : ''
-        const { workspace } = describe(agent)
-        fire('approval', 'DSH 需要你的批准', `${workspace}：${tool}${detail}`)
+        const { workspace, id } = describe(agent)
+        fire('approval', 'DSH 需要你的批准', `${workspace}：${tool}${detail}`, id)
       }
     } catch (error) {
       logger.warn?.(`[${NS}] 处理 approval/request 失败：${error?.message ?? error}`)
@@ -393,12 +401,12 @@ export function apply(ctx) {
   ctx.on('agent/error', payload => {
     const agent = payload?.agent
     if (agent && isSubagent(agent) && !config.includeSubagents) return
-    const { workspace, shortId } = describe(agent)
+    const { workspace, shortId, id } = describe(agent)
     const suffix = shortId === '' ? '' : ` · ${shortId}`
     const raw = payload?.error
     const message = typeof raw === 'string' ? raw : (raw?.message ?? '')
     const detail = message === '' ? '执行过程中出现错误' : String(message).split('\n')[0].slice(0, 120)
-    fire('error', 'DSH 执行出错', `${workspace}${suffix}：${detail}`)
+    fire('error', 'DSH 执行出错', `${workspace}${suffix}：${detail}`, id)
   })
 
   // ── 同源 HTTP 路由（浏览器半身的数据面）────────────────────────────────────
@@ -512,7 +520,7 @@ export function apply(ctx) {
             notify: meta.notify,
             at: meta.at,
           }))
-          return send(200, { config, capabilities: capabilities(), sounds: availableSounds(), focused: windowFocused, clients })
+          return send(200, { config, capabilities: capabilities(), sounds: availableSounds(), focused: windowFocused, clients, lastClick })
         }
 
         if (method === 'POST' && route === '/config') {
@@ -555,6 +563,18 @@ export function apply(ctx) {
             }
           }
           return send(200, { focused: windowFocused })
+        }
+
+        // 浏览器通知被点击时的回执。Chromium 在 Linux 上是否把 click 交回页面
+        // 各版本不一，有了这条回执才能分辨「没跳转」是没收到点击还是没跳成。
+        if (method === 'POST' && route === '/click') {
+          const body = await readJson(req)
+          lastClick = {
+            sessionId: typeof body?.sessionId === 'string' ? body.sessionId.slice(0, 64) : '',
+            kind: typeof body?.kind === 'string' ? body.kind.slice(0, 16) : '',
+            at: Date.now(),
+          }
+          return send(200, { ok: true })
         }
 
         return send(404, { error: `unknown route ${route}` })
