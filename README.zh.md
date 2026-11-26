@@ -12,6 +12,8 @@
 - 通知走 `notify-send`，声音走 `paplay`，并以 `canberra-gtk-play` 兜底
 - 浏览器侧兜底（页内浮层、Web Notification、Web Audio 合成音），
   用于系统通道不可用的环境
+- 可选「优先用浏览器通知」：页面开着时改走浏览器自己的通知，点一下就把浏览器
+  切回对应的 DSH 标签页
 - 所有开关都能在 DSH 设置页调整，也可以直接改一个 JSON 文件
 
 ---
@@ -55,11 +57,20 @@ default-workspace · 44b6a957 的回合已结束
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| Host | `index.js`（500 行） | 监听四类事件、发出真实的系统通知与声音、持久化配置、提供 HTTP API |
-| 浏览器 | `client.js`（682 行） | 设置页、页内浮层，以及在 Host 侧没能送出时用 Web Notification / Web Audio 兜底 |
+| Host | `index.js`（601 行） | 监听四类事件、发出真实的系统通知与声音、持久化配置、提供 HTTP API |
+| 浏览器 | `client.js`（766 行） | 设置页、页内浮层，以及在 Host 侧没能送出时用 Web Notification / Web Audio 兜底 |
 
 是否兜底由 Host 随每个事件返回的两个布尔值 `desktop` 与 `sound` 决定，它们的含义是
 「这次真的发出去了没有」。系统通知既然已经送出，浏览器就保持安静，绝不会提醒两遍。
+
+打开「优先用浏览器通知」（`browserFirst`）后，规则变成：只要还有页面连着，Host 就把
+这次事件定向发给其中一个标签页（优先刚聚焦的那个），并跳过系统通知；页面全关时再退回
+系统通知。定向投递靠每个 SSE 连接自带的 `clientId`，`notify` 帧里的 `channel` 字段告诉
+浏览器这次是不是由它负责弹出。
+
+点通知要回到「发起它的那个会话」，这件事浏览器做不了：DSH Web 的所有会话共用同一个地址，
+浏览器最多把标签页提到前台。所以 `notify` 帧里带着完整 `sessionId`，浏览器半身在点击回调里
+调 `uiWorkspace.openSession(sessionId)` 显式切过去，并回一条 `POST /click` 作为回执。
 
 ---
 
@@ -134,7 +145,7 @@ bundle 在 `package.json` 里声明了自己的 patch：
 - 四类事件的开关
 - 桌面通知 / 提示音的开关，以及完成时的提示音主题
 - 子代理、仅前台不打扰、冷却时间等选项
-- 浏览器兜底分组，并显示当前浏览器通知权限
+- 浏览器通知分组（含「优先用浏览器通知」开关），并显示当前浏览器通知权限
 - **试一下** 一行：每个事件类型一个按钮，走与真实通知完全相同的投递路径
 - 能力检测行：显示本机是否找到了 `notify-send`、`paplay`、`canberra-gtk-play`
 
@@ -169,6 +180,7 @@ profile 目录的解析顺序是 `$DSH_PROFILE_DIR`，否则为
 | `browserToast` | boolean | `true` | 显示页内浮层。 |
 | `browserNotify` | boolean | `true` | 用 Web Notification 兜底。需要浏览器授权。 |
 | `browserSound` | boolean | `false` | 用 Web Audio 合成音兜底。 |
+| `browserFirst` | boolean | `false` | 优先用浏览器通知：页面开着时由浏览器投递，点击通知可切回该标签页；页面关掉后自动退回系统通知。 |
 | `soundTheme` | string | `'complete'` | `turnEnd` 使用的提示音，取值为 `complete`、`message`、`bell`、`none`。 |
 | `events.turnEnd` | boolean | `true` | 回合结束时提醒。 |
 | `events.question` | boolean | `true` | 模型需要你选择时提醒。 |
@@ -221,14 +233,20 @@ profile 目录的解析顺序是 `$DSH_PROFILE_DIR`，否则为
 
 | 行号 | 作用 |
 |---|---|
-| `:187` | `sendDesktop(title, body, kind)` —— 拉起 `notify-send`，带 `-a DSH`、图标、紧迫度、`-t 8000` |
-| `:200` | `playSound(sound)` —— 先 `paplay` 播放主题文件，否则 `canberra-gtk-play` |
-| `:254` | `fire(kind, title, body)` —— 依次应用总开关、单事件开关、冷却，然后分发 |
-| `:289` | `agent/turn-stopping` 处理器 → `turnEnd` |
-| `:299` | `user-questions/request` waterfall 处理器 → `question` |
-| `:317` | `approval/request` waterfall 处理器 → `approval` |
-| `:334` | `agent/error` 处理器 → `error` |
-| `:489` | `ctx.inject(['webServer'])` —— 等 `webServer` 就绪后注册 HTTP 路由 |
+| `:196` | `sendDesktop(title, body, kind)` —— 拉起 `notify-send`，带 `-a DSH`、图标、紧迫度、`-t 8000` |
+| `:209` | `playSound(sound)` —— 先 `paplay` 播放主题文件，否则 `canberra-gtk-play` |
+| `:244` | `broadcast(event, data)` —— 给所有 SSE 连接发一帧 |
+| `:258` | `sendTo(res, event, data)` —— 只给指定连接发一帧 |
+| `:277` | `pickStream()` —— 挑定向投递目标：聚焦的优先，其次最近活跃的 |
+| `:293` | `describe(agent)` —— 取工作区名、会话短号，以及随通知下发的完整 `sessionId` |
+| `:312` | `fire(kind, title, body, sessionId)` —— 依次应用总开关、单事件开关、冷却，然后按 `browserFirst` 决定投递通道 |
+| `:356` | `agent/turn-stopping` 处理器 → `turnEnd` |
+| `:366` | `user-questions/request` waterfall 处理器 → `question` |
+| `:384` | `approval/request` waterfall 处理器 → `approval` |
+| `:401` | `agent/error` 处理器 → `error` |
+| `:473` | `openStream(req, res)` —— SSE 长连接，从 `?client=` 取标签页标识 |
+| `:570` | `POST /click` —— 浏览器通知被点击后的回执；`GET /config` 里的 `lastClick` 即来自此处 |
+| `:590` | `ctx.inject(['webServer'])` —— 等 `webServer` 就绪后注册 HTTP 路由 |
 
 有三个值得了解的设计决定：
 
@@ -250,12 +268,13 @@ profile 目录的解析顺序是 `$DSH_PROFILE_DIR`，否则为
 
 | 行号 | 作用 |
 |---|---|
-| `:238` | `requestPermission()` —— 在用户手势里请求 Web Notification 权限 |
-| `:254` | `beep(kind)` —— 用振荡器现场合成提示音，每类事件一段音符序列 |
-| `:279` | `webNotify(title, body, kind)` —— Web Notification，带按类型的 `tag` 与 `silent: true` |
-| `:308` | `showToast(title, body, tone, onClick)` —— 原生 DOM 页内浮层，7 秒后自动消失 |
-| `:631` | `new EventSource('/api/dsh-notify-linux/events')` —— 订阅实时事件流 |
-| `:671` | `ctx.slots.register({ name: 'settings.section', id: 'dsh-notify-linux', order: 30 })` |
+| `:272` | `requestPermission()` —— 在用户手势里请求 Web Notification 权限 |
+| `:288` | `beep(kind)` —— 用振荡器现场合成提示音，每类事件一段音符序列 |
+| `:313` | `webNotify(title, body, kind, activate)` —— Web Notification，带按类型的 `tag` 与 `silent: true`，点击时回调 `activate` |
+| `:346` | `showToast(title, body, tone, onClick)` —— 原生 DOM 页内浮层，7 秒后自动消失 |
+| `:642` | SSE effect —— 维护配置副本、订阅事件流；`:676` 的 `activate()` 负责点通知后切回会话并回执（会话选择器不是 URL 路由，只能靠 `ctx.uiWorkspace.openSession(id)`；该服务未 inject 时直接读会抛错，因此用 `ctx.reflect.get('uiWorkspace')` 兜底） |
+| `:722` | `new EventSource('/api/dsh-notify-linux/events?client=<clientId>')` —— 订阅实时事件流 |
+| `:755` | `ctx.slots.register({ name: 'settings.section', id: 'dsh-notify-linux', order: 30 })` |
 
 浏览器半身是手写的 `ModuleLoader` 包：无构建步骤，除 shell 已提供的 `react` 外无依赖，
 颜色全部走主题变量，因此跟随明暗模式切换。
@@ -280,11 +299,16 @@ Host 半身在 DSH 的 `webServer` 上注册了同源路由前缀：
 | `GET` | `/api/dsh-notify-linux/config` | 当前配置、工具能力、可用提示音主题、窗口聚焦状态 |
 | `POST` | `/api/dsh-notify-linux/config` | 局部更新配置（深合并，含 `events`），并落盘 |
 | `POST` | `/api/dsh-notify-linux/test` | 用正常链路真实触发一次指定 `kind` 的通知 |
-| `POST` | `/api/dsh-notify-linux/presence` | 上报窗口是否聚焦（供 `onlyWhenUnfocused` 使用） |
-| `GET` | `/api/dsh-notify-linux/events` | SSE 事件流：`hello`（能力）、`notify`（真实的一次投递）、`config`（配置变更） |
+| `POST` | `/api/dsh-notify-linux/presence` | 上报窗口是否聚焦（供 `onlyWhenUnfocused` 使用），并带上 `clientId` 以便定向投递时认出标签页 |
+| `POST` | `/api/dsh-notify-linux/click` | 浏览器通知被点击后的回执（`sessionId`、`kind`），用于排查「点了没跳」 |
+| `GET` | `/api/dsh-notify-linux/events` | SSE 事件流：`hello`（能力）、`notify`（真实的一次投递，帧里带 `channel`）、`config`（配置变更）；可带 `?client=<id>` |
 
 SSE 流每 25 秒发一条 `: ping` 注释，避免空闲连接被中间的代理掐断。浏览器半身在连续
 6 次连接失败后会主动退避（等 30 秒再试），而不是无限紧循环重连。
+
+`notify` 帧里的 `channel` 取 `browser`（由这条连接负责弹出，浏览器会把它和标签页绑定，
+点击通知即切回该标签页）或 `none`（走系统通知）。多个标签页同时开着时，只有被选中的
+那条连接收到事件，不会每个标签页弹一次。
 
 ### 安全边界
 

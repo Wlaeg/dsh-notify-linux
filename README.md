@@ -14,6 +14,8 @@ the page is closed entirely.
 - Notifications via `notify-send`, sounds via `paplay` with a `canberra-gtk-play` fallback
 - Browser-side fallback (in-page toast, Web Notification, synthesized Web Audio chime)
   for environments where the system paths are unavailable
+- Optional **Prefer browser notifications**: while the page is open the browser delivers the
+  notification, and clicking it brings the browser back to that DSH tab
 - All switches configurable in the DSH Settings page or by editing a single JSON file
 
 ---
@@ -60,12 +62,23 @@ The browser half therefore does three different things instead of duplicating de
 
 | Half | File | Responsibility |
 |---|---|---|
-| Host | `index.js` (500 lines) | Listens to the four events, sends the real system notification and sound, persists config, serves the HTTP API |
-| Browser | `client.js` (682 lines) | Settings page, in-page toast overlay, and fallback via Web Notification / Web Audio when the host could not deliver |
+| Host | `index.js` (601 lines) | Listens to the four events, sends the real system notification and sound, persists config, serves the HTTP API |
+| Browser | `client.js` (766 lines) | Settings page, in-page toast overlay, and fallback via Web Notification / Web Audio when the host could not deliver |
 
 Whether the browser falls back is decided by two booleans the host returns with each
 event — `desktop` and `sound`, meaning "this was actually dispatched". If the system
 notification did go out, the browser stays quiet, so you are never notified twice.
+
+With **Prefer browser notifications** (`browserFirst`) on, the rule becomes: as long as a
+page is connected, the host targets that one tab (preferring the one focused most recently)
+and skips the system notification; when every page is closed it falls back to the system
+notification. Targeting uses the `clientId` each SSE connection carries, and the `channel`
+field on a `notify` frame says whether the browser is the one that should surface it.
+
+Getting back to the session that raised the notification is not something the browser does: every
+DSH Web session shares one URL, so the browser can at best raise the tab. The `notify` frame
+therefore carries the full `sessionId`; the browser half calls `uiWorkspace.openSession(sessionId)`
+from the click handler and posts `POST /click` as a receipt.
 
 ---
 
@@ -144,7 +157,7 @@ registered on the `settings.section` slot at order 30). It contains:
 - the four event toggles
 - system notification / sound toggles and the completion-sound theme
 - subagent, focus-only and cooldown options
-- the browser-fallback group with the current browser notification permission
+- the browser notification group (including **Prefer browser notifications**), with the current browser notification permission
 - a **Try it** row with one button per event kind, using the exact same delivery path as
   a real notification
 - a capability row showing whether `notify-send`, `paplay` and `canberra-gtk-play` were
@@ -181,6 +194,7 @@ notification — or use the Settings page, which writes through the same code pa
 | `browserToast` | boolean | `true` | Show the in-page toast overlay. |
 | `browserNotify` | boolean | `true` | Use Web Notification as a fallback. Requires browser permission. |
 | `browserSound` | boolean | `false` | Use the synthesized Web Audio chime as a fallback. |
+| `browserFirst` | boolean | `false` | Prefer browser notifications: while the page is open the browser delivers them and clicking one returns to that tab; falls back to the system notification once the page is closed. |
 | `soundTheme` | string | `'complete'` | Sound used for `turnEnd`. One of `complete`, `message`, `bell`, `none`. |
 | `events.turnEnd` | boolean | `true` | Notify when a turn finishes. |
 | `events.question` | boolean | `true` | Notify when the model needs you to choose. |
@@ -235,14 +249,20 @@ If a file is missing at play time, `paplay` is skipped and the plugin falls back
 
 | Line | What it does |
 |---|---|
-| `:187` | `sendDesktop(title, body, kind)` — spawns `notify-send` with `-a DSH`, icon, urgency, `-t 8000` |
-| `:200` | `playSound(sound)` — `paplay` on the theme file, else `canberra-gtk-play` |
-| `:254` | `fire(kind, title, body)` — applies the master switch, per-event toggle and cooldown, then dispatches |
-| `:289` | `agent/turn-stopping` handler → `turnEnd` |
-| `:299` | `user-questions/request` waterfall handler → `question` |
-| `:317` | `approval/request` waterfall handler → `approval` |
-| `:334` | `agent/error` handler → `error` |
-| `:489` | `ctx.inject(['webServer'])` — registers the HTTP routes once `webServer` is available |
+| `:196` | `sendDesktop(title, body, kind)` — spawns `notify-send` with `-a DSH`, icon, urgency, `-t 8000` |
+| `:209` | `playSound(sound)` — `paplay` on the theme file, else `canberra-gtk-play` |
+| `:244` | `broadcast(event, data)` — writes a frame to every SSE connection |
+| `:258` | `sendTo(res, event, data)` — writes a frame to one connection only |
+| `:277` | `pickStream()` — picks the targeted tab: focused first, then most recently active |
+| `:293` | `describe(agent)` — workspace name, short session id, and the full `sessionId` sent with the notification |
+| `:312` | `fire(kind, title, body, sessionId)` — applies master switch, per-event toggle and cooldown, then picks the channel via `browserFirst` |
+| `:356` | `agent/turn-stopping` handler → `turnEnd` |
+| `:366` | `user-questions/request` waterfall handler → `question` |
+| `:384` | `approval/request` waterfall handler → `approval` |
+| `:401` | `agent/error` handler → `error` |
+| `:473` | `openStream(req, res)` — the SSE connection, taking the tab id from `?client=` |
+| `:570` | `POST /click` — receipt for a clicked browser notification; feeds `lastClick` in `GET /config` |
+| `:590` | `ctx.inject(['webServer'])` — registers the HTTP routes once `webServer` is available |
 
 Three design decisions worth knowing:
 
@@ -269,12 +289,13 @@ during consecutive turns.
 
 | Line | What it does |
 |---|---|
-| `:238` | `requestPermission()` — requests Web Notification permission inside a user gesture |
-| `:254` | `beep(kind)` — synthesizes the chime with oscillators, one note sequence per kind |
-| `:279` | `webNotify(title, body, kind)` — Web Notification with a per-kind `tag` and `silent: true` |
-| `:308` | `showToast(title, body, tone, onClick)` — plain-DOM in-page overlay, auto-dismisses after 7 s |
-| `:631` | `new EventSource('/api/dsh-notify-linux/events')` — subscribes to the live event stream |
-| `:671` | `ctx.slots.register({ name: 'settings.section', id: 'dsh-notify-linux', order: 30 })` |
+| `:272` | `requestPermission()` — requests Web Notification permission inside a user gesture |
+| `:288` | `beep(kind)` — synthesizes the chime with oscillators, one note sequence per kind |
+| `:313` | `webNotify(title, body, kind, activate)` — Web Notification with a per-kind `tag`, `silent: true`, and an `activate` click callback |
+| `:346` | `showToast(title, body, tone, onClick)` — plain-DOM in-page overlay, auto-dismisses after 7 s |
+| `:642` | SSE effect — keeps a config copy and subscribes to the stream; `:676` `activate()` switches back to the session and posts the receipt (the session picker is not a URL route, so it goes through `ctx.uiWorkspace.openSession(id)`; reading that service without `inject` throws, hence the `ctx.reflect.get('uiWorkspace')` fallback) |
+| `:722` | `new EventSource('/api/dsh-notify-linux/events?client=<clientId>')` — subscribes to the live event stream |
+| `:755` | `ctx.slots.register({ name: 'settings.section', id: 'dsh-notify-linux', order: 30 })` |
 
 The browser half is a hand-written `ModuleLoader` bundle: no build step, no dependency
 other than the `react` the shell already provides, and all colors come from theme
@@ -300,8 +321,9 @@ The host half registers a same-origin route prefix on the DSH `webServer`:
 | `GET` | `/api/dsh-notify-linux/config` | Current config, tool capabilities, available sound themes, focus state |
 | `POST` | `/api/dsh-notify-linux/config` | Partial config update (deep-merged, including `events`), persisted to disk |
 | `POST` | `/api/dsh-notify-linux/test` | Fire a real notification of a given `kind` through the normal path |
-| `POST` | `/api/dsh-notify-linux/presence` | Report whether the window is focused (feeds `onlyWhenUnfocused`) |
-| `GET` | `/api/dsh-notify-linux/events` | SSE stream: `hello` (capabilities), `notify` (a real dispatch), `config` (config changed) |
+| `POST` | `/api/dsh-notify-linux/presence` | Report whether the window is focused (feeds `onlyWhenUnfocused`) together with the `clientId`, so targeting can identify the tab |
+| `POST` | `/api/dsh-notify-linux/click` | Receipt for a clicked browser notification (`sessionId`, `kind`); used to diagnose "clicked but did not jump" |
+| `GET` | `/api/dsh-notify-linux/events` | SSE stream: `hello` (capabilities), `notify` (a real dispatch, carrying `channel`), `config` (config changed); accepts `?client=<id>` |
 
 The SSE stream sends a `: ping` comment every 25 s to keep idle connections alive through
 proxies. The browser half backs off after 6 consecutive connection failures (30 s before
